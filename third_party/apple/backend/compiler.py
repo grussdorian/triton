@@ -1,13 +1,30 @@
 import functools
+import hashlib
 import subprocess
 import tempfile
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from types import ModuleType
 
 from triton.backends.compiler import BaseBackend, GPUTarget
+
+
+@dataclass(frozen=True)
+class AppleOptions:
+    num_warps: int = 4
+    num_ctas: int = 1
+    num_stages: int = 3
+    warp_size: int = 32
+    debug: bool = False
+    sanitize_overflow: bool = True
+    backend_name: str = 'apple'
+
+    def hash(self):
+        key = "_".join([f"{name}-{val}" for name, val in sorted(self.__dict__.items())])
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 class AppleBackend(BaseBackend):
@@ -21,10 +38,17 @@ class AppleBackend(BaseBackend):
         self.binary_ext = 'metallib'
 
     def parse_options(self, opts) -> Any:
-        return opts
+        args = {}
+        for k in AppleOptions.__dataclass_fields__.keys():
+            if k in opts and opts[k] is not None:
+                args[k] = opts[k]
+        return AppleOptions(**args)
 
     def load_dialects(self, ctx):
         pass
+
+    def get_codegen_implementation(self, options):
+        return {}
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}
@@ -137,8 +161,48 @@ class AppleBackend(BaseBackend):
                 if os.path.exists(p):
                     os.remove(p)
 
+    def make_ttir(self, src, metadata, options):
+        """Convert Triton IR to Triton IR (optimize)."""
+        from triton._C.libtriton import ir, passes
+
+        mod = src
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+        passes.common.add_inliner(pm)
+        passes.common.add_canonicalizer(pm)
+        passes.ttir.add_combine(pm)
+        passes.ttir.add_reorder_broadcast(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_symbol_dce(pm)
+        passes.ttir.add_loop_unroll(pm)
+        pm.run(mod, 'make_ttir')
+        return mod
+
+    def make_ttgir(self, src, metadata, options):
+        """Convert Triton IR to Triton GPU IR."""
+        from triton._C.libtriton import ir, passes
+
+        mod = src
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+        passes.ttir.add_convert_to_ttgpuir(pm, "cuda:80",
+                                            options.num_warps, 32,
+                                            options.num_ctas)
+        passes.ttgpuir.add_coalesce(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_optimize_thread_locality(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.common.add_canonicalizer(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_symbol_dce(pm)
+        pm.run(mod, 'make_ttgir')
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
+        return mod
+
     def add_stages(self, stages, options, language):
         """Wire the compilation pipeline stages."""
+        stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
+        stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
         stages["spirv"] = lambda src, metadata: self._llvm_to_spirv(src, metadata)
         stages["msl"] = lambda src, metadata: self._spirv_to_msl(src, metadata)
