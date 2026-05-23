@@ -2,6 +2,6 @@
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(TritonApple, m) {
+void init_triton_apple(py::module &&m) {
   m.doc() = "Triton Apple GPU backend bindings";
 }
